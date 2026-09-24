@@ -1256,7 +1256,9 @@ export default function StoryEditor({
                                  <RefreshCw className="w-4 h-4 animate-spin text-amber-400 shrink-0" />
                                  <span>
                                     {isOnline
-                                       ? reconnectState.reason?.includes('SERVICE_UNAVAILABLE')
+                                       ? reconnectState.reason?.includes('SERVER_STARTING')
+                                          ? `伺服器啟動中，等待自動重試 (第 ${reconnectState.attempt}/${reconnectState.maxAttempts} 次)...`
+                                          : reconnectState.reason?.includes('SERVICE_UNAVAILABLE')
                                           ? `模型忙碌，等待自動重試 (第 ${reconnectState.attempt}/${reconnectState.maxAttempts} 次)...`
                                           : `連線中斷，正在自動重連 (第 ${reconnectState.attempt}/${reconnectState.maxAttempts} 次)...`
                                        : '網路離線，等待連線恢復後自動重連...'}
@@ -1306,6 +1308,7 @@ export default function StoryEditor({
                         {(() => {
                            const errLower = generationError.toLowerCase();
                            const isQuota = errLower.includes('quota') || errLower.includes('resource_exhausted') || errLower.includes('429');
+                           const isServerStarting = errLower.includes('server_starting');
                            const isUnavailable = errLower.includes('503') || errLower.includes('unavailable') || errLower.includes('high demand');
                            const isNetwork = errLower.includes('連線中斷') || errLower.includes('failed to fetch') || errLower.includes('network') || errLower.includes('timeout');
 
@@ -1315,7 +1318,13 @@ export default function StoryEditor({
                            let iconColor = 'text-red-400';
                            let btnBg = 'bg-red-600 hover:bg-red-500 text-white';
 
-                           if (isQuota) {
+                           if (isServerStarting) {
+                             titleText = '應用伺服器尚未就緒';
+                             descText = '伺服器仍在啟動，這不是模型產生的故事內容。請稍候重試；若持續發生，請檢查應用部署狀態。';
+                             cardBorder = 'border-orange-900/40 bg-orange-950/20';
+                             iconColor = 'text-orange-400';
+                             btnBg = 'bg-orange-600 hover:bg-orange-500 text-white';
+                           } else if (isQuota) {
                              titleText = '模型配額已達上限 (Model Quota Limit Reached)';
                              descText = '當前模型暫時達到免費用量上限 (429)。您的所有對話記錄已完整保存！建議切換至高額度模型 (如 Gemini 2.5 Flash-Lite) 繼續寫作，或點擊重試。';
                              cardBorder = 'border-amber-900/40 bg-amber-950/15';

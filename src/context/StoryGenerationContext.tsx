@@ -8,6 +8,7 @@ import { updateStory } from '../firebase/db';
 import { loadStoredSettings } from '../types/settings';
 import { authenticatedFetch } from '../firebase/api';
 import { preparePartialRetry } from './generationRetry';
+import { assertGenerationResponse } from './generationResponse';
 
 const BUSY_RETRY_DELAY_SECONDS = 30;
 const MAX_RETRY_DELAY_SECONDS = 60;
@@ -334,6 +335,9 @@ export function StoryGenerationProvider({ children }: { children: ReactNode }) {
         signal: controller.signal
       });
 
+      // A hosting gateway may return a 200/503 HTML warmup page while the API restarts.
+      assertGenerationResponse(res);
+
       if (!res.ok) {
         let errorData: any = {};
         try {
@@ -499,12 +503,16 @@ export function StoryGenerationProvider({ children }: { children: ReactNode }) {
 
         const lowerErr = (displayError + ' ' + rawErrMsg).toLowerCase();
         const httpStatus = Number(err?.status);
-        if (httpStatus === 503 || lowerErr.includes('high demand')) {
+        if (err?.code === 'SERVER_STARTING') {
+          console.warn(`[Generation] Application server is still starting for story ${storyId}.`);
+        } else if (httpStatus === 503 || lowerErr.includes('high demand')) {
           console.warn(`[Generation] Model temporarily unavailable for story ${storyId}.`);
         } else {
           console.error(`[Generation] Error on story ${storyId}:`, err);
         }
-        if (displayError === 'Load failed' || displayError === 'Failed to fetch' || lowerErr.includes('networkerror') || lowerErr.includes('failed to fetch')) {
+        if (err?.code === 'SERVER_STARTING') {
+          displayError = 'SERVER_STARTING: 應用伺服器尚未就緒，正在稍候重試。';
+        } else if (displayError === 'Load failed' || displayError === 'Failed to fetch' || lowerErr.includes('networkerror') || lowerErr.includes('failed to fetch')) {
           displayError = '連線中斷或伺服器回應逾時 (Connection interrupted or server timed out)';
         } else if (lowerErr.includes('503') || lowerErr.includes('high demand') || lowerErr.includes('unavailable') || lowerErr.includes('service_unavailable')) {
           displayError = 'SERVICE_UNAVAILABLE: Gemini 伺服器尖峰高負載 (503 High Demand)，請稍候重試或切換模型。';
@@ -512,7 +520,7 @@ export function StoryGenerationProvider({ children }: { children: ReactNode }) {
           displayError = `QUOTA_EXCEEDED: 當前模型 '${model}' 已達免費用量上限 (429 Quota Exceeded)，建議切換至高額度模型 (如 Gemini 2.5 Flash-Lite) 繼續寫作。`;
         }
 
-        const isUnavailable = lowerErr.includes('503') || lowerErr.includes('unavailable') || lowerErr.includes('high demand');
+        const isUnavailable = httpStatus === 503 || lowerErr.includes('503') || lowerErr.includes('unavailable') || lowerErr.includes('high demand');
         const maxAttempts = isUnavailable ? 1 : 3;
         const nextAttempt = currentAttempt + 1;
         const activeSettings = loadStoredSettings();
