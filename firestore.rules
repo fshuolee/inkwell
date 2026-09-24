@@ -1,0 +1,71 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function isValidId(id) {
+      return id is string && id.size() <= 128;
+    }
+
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+
+    function isValidPreset(data) {
+      return data.keys().hasAll(['userId', 'title', 'prompt', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['userId', 'title', 'prompt', 'createdAt', 'updatedAt', 'model'])
+        && data.userId == request.auth.uid
+        && data.title is string && data.title.size() > 0 && data.title.size() <= 100
+        && data.prompt is string && data.prompt.size() > 0 && data.prompt.size() <= 10000
+        && (!data.keys().hasAny(['model']) || (data.model is string && data.model.size() <= 100));
+    }
+
+    match /presets/{presetId} {
+      allow get: if isSignedIn() && isValidId(presetId) && existing().userId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(presetId)
+                    && isValidPreset(incoming())
+                    && incoming().createdAt == request.time
+                    && incoming().updatedAt == request.time;
+      allow update: if isSignedIn() && isValidId(presetId)
+                    && existing().userId == request.auth.uid
+                    && isValidPreset(incoming())
+                    && incoming().createdAt == existing().createdAt
+                    && incoming().updatedAt == request.time
+                    && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'prompt', 'updatedAt', 'model']);
+      allow delete: if isSignedIn() && isValidId(presetId) && existing().userId == request.auth.uid;
+    }
+
+    function isValidStory(data) {
+      return data.keys().hasAll(['userId', 'title', 'model', 'history', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['userId', 'title', 'model', 'history', 'createdAt', 'updatedAt', 'presetId'])
+        && data.userId == request.auth.uid
+        && data.title is string && data.title.size() > 0 && data.title.size() <= 200
+        && data.model is string && data.model.size() > 0 && data.model.size() <= 100
+        && data.history is list && data.history.size() <= 500
+        && (data.history.size() == 0 || (data.history[0] is map))
+        && (!data.keys().hasAny(['presetId']) || (data.presetId is string && data.presetId.size() <= 128));
+    }
+
+    match /stories/{storyId} {
+      allow get: if isSignedIn() && isValidId(storyId) && existing().userId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(storyId)
+                    && isValidStory(incoming())
+                    && incoming().createdAt == request.time
+                    && incoming().updatedAt == request.time;
+      allow update: if isSignedIn() && isValidId(storyId)
+                    && existing().userId == request.auth.uid
+                    && isValidStory(incoming())
+                    && incoming().createdAt == existing().createdAt
+                    && incoming().updatedAt == request.time
+                    && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'history', 'updatedAt', 'model', 'presetId']);
+      allow delete: if isSignedIn() && isValidId(storyId) && existing().userId == request.auth.uid;
+    }
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "entities": {
+    "Preset": {
+      "title": "Preset",
+      "description": "A saved system prompt preset for AI generation",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "title": { "type": "string" },
+        "prompt": { "type": "string" },
+        "createdAt": { "type": "string", "format": "timestamp" },
+        "updatedAt": { "type": "string", "format": "timestamp" }
+      },
+      "required": ["userId", "title", "prompt", "createdAt", "updatedAt"]
+    },
+    "Story": {
+      "title": "Story",
+      "description": "A saved interactive story",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "title": { "type": "string" },
+        "model": { "type": "string" },
+        "history": {
+          "type": "array",
+          "items": { "type": "object" }
+        },
+        "createdAt": { "type": "string", "format": "timestamp" },
+        "updatedAt": { "type": "string", "format": "timestamp" }
+      },
+      "required": ["userId", "title", "model", "history", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/presets/{presetId}": {
+      "schema": { "$ref": "#/entities/Preset" },
+      "description": "Presets created by users"
+    },
+    "/stories/{storyId}": {
+      "schema": { "$ref": "#/entities/Story" },
+      "description": "Stories saved by users"
+    }
+  }
+}
