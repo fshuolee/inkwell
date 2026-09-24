@@ -428,7 +428,10 @@ export default function StoryEditor({
     let historyToUse = baseMessages || messages;
     let promptToSend = customPrompt;
 
+    let retryPartial = '';
     if (isRetry) {
+      const lastMessage = historyToUse[historyToUse.length - 1];
+      if (lastMessage?.role === 'model') retryPartial = lastMessage.text;
       // Find the last user prompt in historyToUse
       const lastUserIndex = historyToUse.map(m => m.role).lastIndexOf('user');
       if (lastUserIndex !== -1) {
@@ -481,6 +484,8 @@ export default function StoryEditor({
       presetId: currentPresetId,
       baseHistory: historyToUse,
       isRetry: false,
+      initialAccumulated: retryPartial,
+      currentAttempt: 0,
       onStorySaved: (savedId) => {
         if (savedId === activeStoryId) {
           setAutoSaveStatus('saved');
@@ -1251,7 +1256,9 @@ export default function StoryEditor({
                                  <RefreshCw className="w-4 h-4 animate-spin text-amber-400 shrink-0" />
                                  <span>
                                     {isOnline
-                                       ? `連線中斷，正在自動重連 (第 ${reconnectState.attempt}/${reconnectState.maxAttempts} 次)...`
+                                       ? reconnectState.reason?.includes('SERVICE_UNAVAILABLE')
+                                          ? `模型忙碌，等待自動重試 (第 ${reconnectState.attempt}/${reconnectState.maxAttempts} 次)...`
+                                          : `連線中斷，正在自動重連 (第 ${reconnectState.attempt}/${reconnectState.maxAttempts} 次)...`
                                        : '網路離線，等待連線恢復後自動重連...'}
                                  </span>
                               </div>
@@ -1316,13 +1323,13 @@ export default function StoryEditor({
                              btnBg = 'bg-amber-500 hover:bg-amber-400 text-black';
                            } else if (isUnavailable) {
                              titleText = '服務尖峰高負載 (503 Service High Demand)';
-                             descText = 'Google 模型伺服器目前處於瞬間流量尖峰。您的所有對話皆已妥善保存，請稍候重試或切換備用模型。';
+                             descText = 'Google 模型目前忙碌。畫面上的內容會保留供您繼續操作；請稍候重試或切換模型。';
                              cardBorder = 'border-indigo-900/40 bg-indigo-950/20';
                              iconColor = 'text-indigo-400';
                              btnBg = 'bg-indigo-600 hover:bg-indigo-500 text-white';
                            } else if (isNetwork) {
                              titleText = '網路連線逾時或中斷 (Network Interrupted)';
-                             descText = '與伺服器的連線發生中斷或逾時。您的所有對話記錄皆完整保存在本機與雲端，請檢查網路連線後點擊重試。';
+                             descText = '與伺服器的連線發生中斷或逾時。請檢查網路連線及同步狀態，然後點擊重試。';
                              cardBorder = 'border-orange-900/40 bg-orange-950/20';
                              iconColor = 'text-orange-400';
                              btnBg = 'bg-orange-600 hover:bg-orange-500 text-white';
@@ -1335,7 +1342,7 @@ export default function StoryEditor({
                                  <div className="space-y-1.5 flex-1">
                                    <div className="flex items-center justify-between">
                                      <h4 className={`font-semibold text-sm ${iconColor}`}>{titleText}</h4>
-                                     <span className="text-[10px] text-zinc-500 bg-zinc-900 px-2 py-0.5 rounded border border-zinc-800">對話已安全保存</span>
+                                     <span className="text-[10px] text-zinc-500 bg-zinc-900 px-2 py-0.5 rounded border border-zinc-800">請檢查同步狀態</span>
                                    </div>
                                    <p className="text-xs text-zinc-400 leading-relaxed">
                                      {descText}

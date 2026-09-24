@@ -5,11 +5,17 @@ import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import firebaseConfig from './firebase-applet-config.json';
 import { verifyFirebaseToken } from './firebaseToken';
+import { classifyModelError, openModelStream } from './modelFallback';
 
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 3000);
   const maxRequestBody = process.env.MAX_REQUEST_BODY || '2mb';
+  const defaultModel = process.env.DEFAULT_GEMINI_MODEL || 'gemini-2.5-flash-lite';
+  const configuredFallbackModels = (process.env.GEMINI_FALLBACK_MODELS || `gemini-3.5-flash-lite,gemini-3.8-flash,${defaultModel},gemini-2.5-flash`)
+    .split(',').map(model => model.trim()).filter(Boolean);
+  const unavailableCooldownMs = Number(process.env.GEMINI_UNAVAILABLE_COOLDOWN_MS || 30_000);
+  const minimumOverlapLength = Number(process.env.MIN_CONTINUATION_OVERLAP || 4);
 
   // Limit request bodies so large histories cannot exhaust server memory.
   app.use(express.json({ limit: maxRequestBody }));
@@ -76,9 +82,9 @@ async function startServer() {
     const prevTail = prevText.slice(-maxSearchLen);
 
     // 1. Direct Longest Suffix-Prefix Exact Match
-    // Search from the maximum possible overlap down to 1 character
+    // Search from the maximum possible overlap down to the configured minimum.
     const maxPossible = Math.min(prevTail.length, newText.length);
-    for (let len = maxPossible; len >= 1; len--) {
+    for (let len = maxPossible; len >= minimumOverlapLength; len--) {
       const prevSuffix = prevTail.slice(-len);
       const newPrefix = newText.slice(0, len);
       if (prevSuffix === newPrefix) {
@@ -96,7 +102,7 @@ async function startServer() {
       const wsPrefix = leadingWsMatch[0];
       const newTextNoWs = newText.slice(wsPrefix.length);
       const maxNoWs = Math.min(prevTail.length, newTextNoWs.length);
-      for (let len = maxNoWs; len >= 1; len--) {
+      for (let len = maxNoWs; len >= minimumOverlapLength; len--) {
         const prevSuffix = prevTail.slice(-len);
         const newPrefix = newTextNoWs.slice(0, len);
         if (prevSuffix === newPrefix) {
@@ -113,7 +119,7 @@ async function startServer() {
     const trimmedPrevTail = prevTail.trimEnd();
     if (trimmedPrevTail.length > 0 && trimmedPrevTail.length < prevTail.length) {
       const maxTrimmed = Math.min(trimmedPrevTail.length, newText.length);
-      for (let len = maxTrimmed; len >= 1; len--) {
+      for (let len = maxTrimmed; len >= minimumOverlapLength; len--) {
         const prevSuffix = trimmedPrevTail.slice(-len);
         const newPrefix = newText.slice(0, len);
         if (prevSuffix === newPrefix) {
@@ -147,7 +153,7 @@ async function startServer() {
 
   // API Route for Gemini Generation (with streaming support)
   app.post('/api/generate', async (req, res) => {
-    let chatModel = "gemini-2.5-flash-lite";
+    let chatModel = defaultModel;
     let isClientDisconnected = false;
     res.on('close', () => {
       if (!res.writableEnded) {
@@ -158,8 +164,10 @@ async function startServer() {
     try {
       if (!req.body || typeof req.body !== 'object' ||
           (req.body.prompt !== undefined && typeof req.body.prompt !== 'string') ||
-          (req.body.model !== undefined && typeof req.body.model !== 'string') ||
+          (req.body.model !== undefined && (typeof req.body.model !== 'string' ||
+            req.body.model.length > 100 || !/^[a-zA-Z0-9._-]+$/.test(req.body.model))) ||
           (req.body.systemInstruction !== undefined && typeof req.body.systemInstruction !== 'string') ||
+          (req.body.previousText !== undefined && typeof req.body.previousText !== 'string') ||
           (req.body.history !== undefined && (!Array.isArray(req.body.history) ||
             req.body.history.some((message: unknown) => !message || typeof message !== 'object' ||
               !['user', 'model'].includes((message as { role?: string }).role || '') ||
@@ -167,7 +175,7 @@ async function startServer() {
         res.status(400).json({ error: 'Invalid generation request.' });
         return;
       }
-      const { prompt, model, systemInstruction, history, temperature, settings } = req.body;
+      const { prompt, model, systemInstruction, history, temperature, settings, previousText } = req.body;
       
       // Parse user settings with defaults
       const optAutoModelFallback = settings?.autoModelFallback !== false; // default true
@@ -176,7 +184,7 @@ async function startServer() {
       const optAutoFillDefaultPrompt = settings?.autoFillDefaultPrompt !== false; // default true
       const optAutoRepromptOnAbruptEnd = settings?.autoRepromptOnAbruptEnd !== false; // default true
 
-      chatModel = model || "gemini-2.5-flash-lite";
+      chatModel = model || defaultModel;
       // Strictly use the systemInstruction sent by the client at generation time without any extra injected text
       const rawInstruction = typeof systemInstruction === 'string' ? systemInstruction.trim() : '';
       const instruction = rawInstruction || "You are a creative story writer.";
@@ -235,7 +243,7 @@ async function startServer() {
       let actualModelUsed = chatModel;
 
       // Track the total clean text streamed to the client across all attempts
-      let totalStreamedText = "";
+      let totalStreamedText = previousText || "";
 
       const ensureHeadersSent = () => {
         if (!res.headersSent) {
@@ -249,39 +257,16 @@ async function startServer() {
       };
 
       // Build model candidate list based on user's autoModelFallback setting
-      let fallbackCandidates: string[] = [];
-      if (!optAutoModelFallback) {
-        // Transparent mode: Strictly and exclusively use the user's chosen model!
-        fallbackCandidates = [chatModel];
-      } else {
-        // High-availability mode: Build fallback chain across separate quota allocations
-        const now = Date.now();
-        const allCandidateModels = [
-          chatModel,
-          'gemini-2.5-flash-lite',
-          'gemini-3.1-flash-lite',
-          'gemini-3.5-flash-lite',
-          'gemini-flash-lite-latest',
-          'gemini-3.8-flash',
-          'gemini-3.7-flash',
-          'gemini-3.5-flash',
-          'gemini-flash-latest',
-          'gemini-2.5-flash'
-        ].filter((m, idx, self) => self.indexOf(m) === idx);
-
-        // Prioritize models that are NOT currently in rate-limit cooldown
-        fallbackCandidates = allCandidateModels.sort((a, b) => {
-          const cooldownA = modelCooldowns.get(a) || 0;
-          const cooldownB = modelCooldowns.get(b) || 0;
-          const isCooldownA = cooldownA > now;
-          const isCooldownB = cooldownB > now;
-          if (isCooldownA && !isCooldownB) return 1;
-          if (!isCooldownA && isCooldownB) return -1;
-          if (isCooldownA && isCooldownB) return cooldownA - cooldownB;
-          if (a === chatModel) return -1;
-          if (b === chatModel) return 1;
-          return 0;
-        });
+      const candidateModels = [...new Set(optAutoModelFallback
+        ? [chatModel, ...configuredFallbackModels]
+        : [chatModel])];
+      const now = Date.now();
+      const fallbackCandidates = candidateModels.filter(candidate => (modelCooldowns.get(candidate) || 0) <= now);
+      if (fallbackCandidates.length === 0) {
+        const nextAvailable = Math.min(...candidateModels.map(candidate => modelCooldowns.get(candidate) || now));
+        res.setHeader('Retry-After', Math.max(1, Math.ceil((nextAvailable - now) / 1_000)));
+        res.status(503).json({ error: 'SERVICE_UNAVAILABLE: Models are temporarily busy. Please retry shortly.' });
+        return;
       }
 
       console.log(`[API] Candidate chain for turn:`, fallbackCandidates);
@@ -289,68 +274,38 @@ async function startServer() {
       while (keepGenerating && attempts < maxAttempts) {
         if (isClientDisconnected) break;
         attempts++;
-        let responseStream;
-        let lastModelError: any = null;
-
-        for (const candidateModel of fallbackCandidates) {
-          if (isClientDisconnected) break;
-          try {
-            console.log(`[API] Generation attempt #${attempts} using model candidate: ${candidateModel}`);
-            responseStream = await ai.models.generateContentStream({
-              model: candidateModel,
-              contents: currentContents,
-              config: {
-                systemInstruction: instruction,
-                temperature: genTemperature,
-              },
-            });
-            actualModelUsed = candidateModel;
-            chatModel = candidateModel;
-            break;
-          } catch (err: any) {
-            lastModelError = err;
-            const errMsg = String(err?.message || err);
-            console.warn(`[API] Model candidate '${candidateModel}' failed. Trying next candidate. Error:`, errMsg.slice(0, 180));
-
-            // Record cooldown if 429 quota exhaustion or rate limit
-            if (errMsg.includes('429') || errMsg.includes('RESOURCE_EXHAUSTED') || errMsg.includes('quota')) {
-              let cooldownSeconds = 60;
-              const retryMatch = errMsg.match(/retry in ([\d\.]+)s/i) || errMsg.match(/"retryDelay":\s*"(\d+)s"/i);
-              if (retryMatch) {
-                cooldownSeconds = Math.ceil(parseFloat(retryMatch[1])) + 2;
-              }
-              modelCooldowns.set(candidateModel, Date.now() + cooldownSeconds * 1000);
-              console.log(`[API] Model '${candidateModel}' marked in cooldown for ${cooldownSeconds}s`);
-            } else if (errMsg.includes('503') || errMsg.includes('high demand') || errMsg.includes('UNAVAILABLE')) {
-              // 503 spike, briefly pause before trying next candidate to relieve gateway pressure
-              await new Promise(r => setTimeout(r, 400));
+        const availableCandidates = fallbackCandidates.filter(candidate => (modelCooldowns.get(candidate) || 0) <= Date.now());
+        if (availableCandidates.length === 0) {
+          const nextAvailable = Math.min(...fallbackCandidates.map(candidate => modelCooldowns.get(candidate) || Date.now()));
+          throw Object.assign(new Error('All model candidates are temporarily unavailable'), {
+            status: 503,
+            retryAfterMs: Math.max(1_000, nextAvailable - Date.now()),
+          });
+        }
+        const { model: selectedModel, stream: responseStream } = await openModelStream(
+          availableCandidates,
+          candidateModel => ai.models.generateContentStream({
+            model: candidateModel,
+            contents: currentContents,
+            config: { systemInstruction: instruction, temperature: genTemperature },
+          }),
+          error => optAutoModelFallback && [404, 429, 503].includes(classifyModelError(error).status || 0),
+          (candidateModel, error) => {
+            const { status, retryAfterMs } = classifyModelError(error);
+            console.warn(`[API] Model ${candidateModel} failed before streaming (status ${status ?? 'unknown'}).`);
+            if (status === 429 || status === 503) {
+              modelCooldowns.set(candidateModel, Date.now() + (retryAfterMs || unavailableCooldownMs));
             }
-          }
-        }
-
-        // Safety net fallback: only execute if autoModelFallback is enabled
-        if (!responseStream && !isClientDisconnected && optAutoModelFallback) {
-          console.warn("[API] Initial candidates failed. Attempting final safety fallback to gemini-2.5-flash-lite...");
-          await new Promise(r => setTimeout(r, 1000));
-          try {
-            responseStream = await ai.models.generateContentStream({
-              model: 'gemini-2.5-flash-lite',
-              contents: currentContents,
-              config: {
-                systemInstruction: instruction,
-                temperature: genTemperature,
-              },
-            });
-            actualModelUsed = 'gemini-2.5-flash-lite';
-            chatModel = 'gemini-2.5-flash-lite';
-          } catch (safetyErr: any) {
-            lastModelError = safetyErr;
-          }
-        }
-
-        if (!responseStream) {
-          throw lastModelError || new Error(`Failed to generate content with model '${chatModel}'.`);
-        }
+          },
+          chunk => {
+            try {
+              if (chunk.text) return true;
+            } catch { /* Some non-text chunks have no text accessor. */ }
+            return Boolean(chunk.candidates?.[0]?.finishReason || chunk.candidates?.[0]?.content?.parts?.[0]?.text);
+          },
+        );
+        actualModelUsed = selectedModel;
+        chatModel = selectedModel;
 
         // Stream started successfully, ensure response headers are sent
         ensureHeadersSent();
@@ -361,7 +316,7 @@ async function startServer() {
 
         // Deduplication & Streaming behavior
         // If optAutoDeduplicateOverlap is false, stream raw text directly without any buffering or overlap stripping
-        let overlapResolved = !optAutoDeduplicateOverlap || attempts === 1;
+        let overlapResolved = !optAutoDeduplicateOverlap || (attempts === 1 && !previousText);
         const maxOverlapCheckWindow = Math.min(400, totalStreamedText.length) + 40;
 
         for await (const chunk of responseStream) {
@@ -501,7 +456,8 @@ async function startServer() {
 
       res.end();
     } catch (error: any) {
-      console.error("Gemini API Error:", error);
+      const { status, retryAfterMs } = classifyModelError(error);
+      console.error(`[API] Gemini generation failed for ${chatModel} (status ${status ?? 'unknown'}).`);
       let rawError = String(error?.message || error || "Failed to generate content");
       
       // Robust recursive extraction of nested JSON error payloads
@@ -531,12 +487,12 @@ async function startServer() {
       let friendlyError = extractDeepErrorMessage(rawError);
       const errorStr = (rawError + " " + friendlyError).toLowerCase();
 
-      const isQuota = errorStr.includes('quota') || 
-                      errorStr.includes('resource_exhausted') || 
-                      errorStr.includes('rate_limit') || 
+      const isQuota = status === 429 || errorStr.includes('quota') ||
+                      errorStr.includes('resource_exhausted') ||
+                      errorStr.includes('rate_limit') ||
                       errorStr.includes('429');
-      const isUnavailable = errorStr.includes('503') || 
-                            errorStr.includes('high demand') || 
+      const isUnavailable = status === 503 || errorStr.includes('503') ||
+                            errorStr.includes('high demand') ||
                             errorStr.includes('unavailable');
 
       if (isQuota) {
@@ -544,12 +500,23 @@ async function startServer() {
         let retryPart = retryMatch ? ` Please retry in ${retryMatch[1]}.` : '';
         friendlyError = `QUOTA_EXCEEDED: Model '${chatModel}' has temporarily exceeded usage quota.${retryPart} Try switching models or retrying shortly.`;
       } else if (isUnavailable) {
-        friendlyError = `SERVICE_UNAVAILABLE: Gemini models are currently experiencing temporary high demand spikes. The system will auto-retry momentarily.`;
+        friendlyError = 'SERVICE_UNAVAILABLE: The selected models are temporarily busy. Please retry shortly or choose another model.';
+      } else if (status === 400 || status === 404) {
+        friendlyError = 'INVALID_MODEL_OR_REQUEST: The selected model could not process this request. Please choose another model or edit the prompt.';
+      } else if (status === 401 || status === 403) {
+        friendlyError = 'AI_SERVICE_AUTH_ERROR: The server could not access Gemini. Please check its API credentials.';
+      } else {
+        friendlyError = 'Generation failed unexpectedly. Please retry shortly.';
       }
 
-      const statusCode = isQuota ? 429 : isUnavailable ? 503 : 500;
+      const statusCode = isQuota ? 429 : isUnavailable ? 503
+        : status === 400 || status === 404 ? 400
+        : status === 401 || status === 403 ? 403 : 500;
 
       if (!res.headersSent) {
+        if (isQuota || isUnavailable) {
+          res.setHeader('Retry-After', Math.ceil((retryAfterMs || unavailableCooldownMs) / 1_000));
+        }
         res.status(statusCode).json({ error: friendlyError });
       } else {
         res.write(`\n\n[ERROR: ${friendlyError}]`);
@@ -585,19 +552,14 @@ async function startServer() {
 
       const models = preferredModels.filter(pm => allListed.has(pm.name));
       if (models.length === 0) {
-        res.json({ models: preferredModels });
+        res.json({ models: configuredFallbackModels.map(name => ({ name, displayName: name })) });
       } else {
         res.json({ models });
       }
     } catch (error: any) {
       console.error("List Models Error:", error);
       res.json({
-        models: [
-          { name: 'gemini-2.5-flash-lite', displayName: 'Gemini 2.5 Flash-Lite (Recommended)' },
-          { name: 'gemini-3.8-flash', displayName: 'Gemini 3.8 Flash' },
-          { name: 'gemini-3.1-flash-lite', displayName: 'Gemini 3.1 Flash-Lite' },
-          { name: 'gemini-2.5-flash', displayName: 'Gemini 2.5 Flash' }
-        ]
+        models: configuredFallbackModels.map(name => ({ name, displayName: name }))
       });
     }
   });
