@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Preset, getPresets, createPreset, updatePreset, deletePreset, generateSafeUUID } from '../firebase/db';
 import { Save, Plus, Trash2, Edit2, CheckCircle2, Menu, AlertCircle, X, Loader2 } from 'lucide-react';
 import { auth } from '../firebase/auth';
+import { authenticatedFetch } from '../firebase/api';
 
 export default function PresetManager({ onToggleSidebar }: { onToggleSidebar: () => void }) {
   const [presets, setPresets] = useState<Preset[]>([]);
@@ -27,7 +28,7 @@ export default function PresetManager({ onToggleSidebar }: { onToggleSidebar: ()
 
   const loadModels = async () => {
     try {
-      const res = await fetch('/api/models');
+      const res = await authenticatedFetch('/api/models');
       const data = await res.json();
       if (data.models && data.models.length > 0) {
         const sorted = data.models.sort((a: any, b: any) => getCapabilityRank(b.name) - getCapabilityRank(a.name));

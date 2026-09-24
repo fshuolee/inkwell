@@ -15,6 +15,7 @@ import {
   SlidersHorizontal
 } from 'lucide-react';
 import { useSettings } from '../context/SettingsContext';
+import { authenticatedFetch } from '../firebase/api';
 
 interface SettingsPageProps {
   onToggleSidebar?: () => void;
@@ -26,7 +27,7 @@ export default function SettingsPage({ onToggleSidebar, onBackToEditor }: Settin
   const [availableModels, setAvailableModels] = useState<{ name: string; displayName: string }[]>([]);
 
   useEffect(() => {
-    fetch('/api/models')
+    authenticatedFetch('/api/models')
       .then((res) => res.json())
       .then((data) => {
         if (data.models && Array.isArray(data.models)) {

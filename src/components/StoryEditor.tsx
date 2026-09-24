@@ -6,6 +6,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Story, Preset, getPresets, createStory, updateStory, generateSafeUUID, getStory, deleteStory } from '../firebase/db';
 import { auth } from '../firebase/auth';
+import { authenticatedFetch } from '../firebase/api';
 import { Send, Save, DownloadCloud, Loader2, FileText, RefreshCw, AlertCircle, Menu, X, CheckCircle2, Settings, Play, Edit2, Check, Square, Trash2, WifiOff, Sliders } from 'lucide-react';
 import Markdown from 'react-markdown';
 import { getAccessToken, googleSignIn } from '../firebase/auth';
@@ -210,7 +211,7 @@ export default function StoryEditor({
 
   const fetchModels = async () => {
     try {
-      const res = await fetch('/api/models');
+      const res = await authenticatedFetch('/api/models');
       if (res.ok) {
         const data = await res.json();
         setAvailableModels(data.models);

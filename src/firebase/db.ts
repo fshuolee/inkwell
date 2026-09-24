@@ -1,4 +1,5 @@
 import { auth, logout, safeStorage } from './auth';
+import { filterOwnedData, readLocalData, writeLocalData } from './localData';
 
 export type SyncStatus = 'idle' | 'syncing' | 'synced' | 'error' | 'unauthorized';
 export type SyncListener = (status: SyncStatus, lastSynced?: Date, errorMsg?: string) => void;
@@ -269,24 +270,12 @@ async function downloadDriveFile(fileId: string): Promise<AppData> {
 }
 
 function getLocalData(): AppData {
-  try {
-    const raw = safeStorage.getItem('inkwell_local_data');
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      return {
-        presets: parsed.presets || [],
-        stories: parsed.stories || []
-      };
-    }
-  } catch (e) {
-    console.error("Failed to read local data:", e);
-  }
-  return { presets: [], stories: [] };
+  return readLocalData<Preset, Story>(safeStorage, auth.currentUser?.uid || null);
 }
 
 function saveLocalData(data: AppData): void {
   try {
-    safeStorage.setItem('inkwell_local_data', JSON.stringify(data));
+    writeLocalData(safeStorage, auth.currentUser?.uid || null, data);
   } catch (e) {
     console.error("Failed to save local data:", e);
   }
@@ -345,6 +334,7 @@ export async function loadData(): Promise<AppData> {
     // Invalidate caches if user signed out or toggled
     cachedData = null;
     driveFileId = null;
+    driveFolderId = null;
     loadPromise = null;
     cachedUserId = currentUid;
   }
@@ -402,10 +392,9 @@ export async function loadData(): Promise<AppData> {
         content = await downloadDriveFile(fileId);
       }
       
-      cachedData = {
-        presets: content.presets || [],
-        stories: content.stories || []
-      };
+      cachedData = currentUid
+        ? filterOwnedData<Preset, Story>(content, currentUid)
+        : { presets: [], stories: [] };
       
       saveLocalData(cachedData);
       updateSyncStatus('synced');

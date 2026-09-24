@@ -6,6 +6,7 @@
 import React, { createContext, useContext, useState, useRef, useEffect, useCallback, ReactNode } from 'react';
 import { updateStory } from '../firebase/db';
 import { loadStoredSettings } from '../types/settings';
+import { authenticatedFetch } from '../firebase/api';
 
 export interface Message {
   role: 'user' | 'model';
@@ -306,7 +307,7 @@ export function StoryGenerationProvider({ children }: { children: ReactNode }) {
 
     try {
       const activeSettings = loadStoredSettings();
-      const res = await fetch('/api/generate', {
+      const res = await authenticatedFetch('/api/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

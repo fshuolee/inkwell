@@ -1,15 +1,18 @@
+import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
+import firebaseConfig from './firebase-applet-config.json';
+import { verifyFirebaseToken } from './firebaseToken';
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT || 3000);
+  const maxRequestBody = process.env.MAX_REQUEST_BODY || '2mb';
 
-  // Middleware to parse JSON bodies with larger limits to avoid PayloadTooLargeError
-  app.use(express.json({ limit: '50mb' }));
-  app.use(express.urlencoded({ limit: '50mb', extended: true }));
+  // Limit request bodies so large histories cannot exhaust server memory.
+  app.use(express.json({ limit: maxRequestBody }));
 
   // Custom error handler for JSON parsing errors (e.g. PayloadTooLargeError)
   app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -32,6 +35,23 @@ async function startServer() {
       headers: {
         'User-Agent': 'aistudio-build',
       }
+    }
+  });
+
+  // The browser login alone does not protect these routes: verify each token server-side.
+  app.use('/api', async (req, res, next) => {
+    const authorization = req.header('authorization');
+    const token = authorization?.match(/^Bearer (\S+)$/)?.[1];
+    if (!token) {
+      res.status(401).json({ error: 'Please sign in to use the API.' });
+      return;
+    }
+    try {
+      await verifyFirebaseToken(token, firebaseConfig.projectId);
+      next();
+    } catch (error) {
+      console.warn('[API] Rejected invalid Firebase ID token:', error);
+      res.status(401).json({ error: 'Your session has expired. Please sign in again.' });
     }
   });
 
@@ -136,6 +156,17 @@ async function startServer() {
     });
 
     try {
+      if (!req.body || typeof req.body !== 'object' ||
+          (req.body.prompt !== undefined && typeof req.body.prompt !== 'string') ||
+          (req.body.model !== undefined && typeof req.body.model !== 'string') ||
+          (req.body.systemInstruction !== undefined && typeof req.body.systemInstruction !== 'string') ||
+          (req.body.history !== undefined && (!Array.isArray(req.body.history) ||
+            req.body.history.some((message: unknown) => !message || typeof message !== 'object' ||
+              !['user', 'model'].includes((message as { role?: string }).role || '') ||
+              typeof (message as { text?: unknown }).text !== 'string')))) {
+        res.status(400).json({ error: 'Invalid generation request.' });
+        return;
+      }
       const { prompt, model, systemInstruction, history, temperature, settings } = req.body;
       
       // Parse user settings with defaults
