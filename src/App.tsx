@@ -36,6 +36,7 @@ function AppContent() {
   useEffect(() => {
     const unsubAuth = initAuth(
       (u, t) => {
+        setStories([]);
         setUser(u);
         setToken(t);
         setIsAuthPending(false);
@@ -44,6 +45,7 @@ function AppContent() {
         }
       },
       () => {
+        setStories([]);
         setUser(null);
         setToken(null);
         setIsAuthPending(false);

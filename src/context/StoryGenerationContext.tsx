@@ -6,6 +6,11 @@
 import React, { createContext, useContext, useState, useRef, useEffect, useCallback, ReactNode } from 'react';
 import { updateStory } from '../firebase/db';
 import { loadStoredSettings } from '../types/settings';
+import { authenticatedFetch } from '../firebase/api';
+import { preparePartialRetry } from './generationRetry';
+
+const BUSY_RETRY_DELAY_SECONDS = 30;
+const MAX_RETRY_DELAY_SECONDS = 60;
 
 export interface Message {
   role: 'user' | 'model';
@@ -220,12 +225,15 @@ export function StoryGenerationProvider({ children }: { children: ReactNode }) {
     clearReconnectTimers(storyId);
 
     let promptText = prompt;
+    let apiPrompt = prompt;
     let historyForApi: Message[] = [...baseHistory];
     let newDisplayHistory: Message[] = [...baseHistory];
 
-    if (currentAttempt > 0 && initialAccumulated) {
-      newDisplayHistory = [...baseHistory];
-      historyForApi = baseHistory.filter(m => !(m.role === 'model' && m.text === initialAccumulated));
+    if (initialAccumulated) {
+      const retry = preparePartialRetry(baseHistory, prompt, initialAccumulated);
+      newDisplayHistory = retry.displayHistory;
+      historyForApi = retry.apiHistory;
+      apiPrompt = retry.apiPrompt;
     } else if (isRetry) {
       // Find the last user message in baseHistory
       let lastUserIndex = -1;
@@ -237,10 +245,12 @@ export function StoryGenerationProvider({ children }: { children: ReactNode }) {
       }
       if (lastUserIndex !== -1) {
         promptText = baseHistory[lastUserIndex].text;
+        apiPrompt = promptText;
         historyForApi = baseHistory.slice(0, lastUserIndex);
         newDisplayHistory = baseHistory.slice(0, lastUserIndex + 1);
       } else if (prompt && prompt.trim()) {
         promptText = prompt.trim();
+        apiPrompt = promptText;
         newDisplayHistory = [...baseHistory, { role: 'user', text: promptText }];
         historyForApi = [...baseHistory];
       } else {
@@ -248,6 +258,7 @@ export function StoryGenerationProvider({ children }: { children: ReactNode }) {
       }
     } else {
       promptText = prompt.trim();
+      apiPrompt = promptText;
       const userMsg: Message = { role: 'user', text: promptText };
       newDisplayHistory = [...baseHistory, userMsg];
       historyForApi = [...baseHistory];
@@ -294,7 +305,9 @@ export function StoryGenerationProvider({ children }: { children: ReactNode }) {
     // the user's input/dialogue is NEVER lost!
     try {
       await updateStory(storyId, {
-        history: newDisplayHistory,
+        history: initialAccumulated
+          ? [...newDisplayHistory, { role: 'model', text: initialAccumulated }]
+          : newDisplayHistory,
         model,
         systemInstruction: systemInstruction || undefined,
         presetId: presetId || undefined
@@ -304,16 +317,18 @@ export function StoryGenerationProvider({ children }: { children: ReactNode }) {
       console.warn(`[Generation] Pre-save of user prompt for story ${storyId}:`, saveErr);
     }
 
+    let effectiveModel = model;
     try {
       const activeSettings = loadStoredSettings();
-      const res = await fetch('/api/generate', {
+      const res = await authenticatedFetch('/api/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          prompt: promptText,
+          prompt: apiPrompt,
           model,
           systemInstruction,
           history: historyForApi,
+          previousText: initialAccumulated,
           settings: activeSettings
         }),
         signal: controller.signal
@@ -324,8 +339,16 @@ export function StoryGenerationProvider({ children }: { children: ReactNode }) {
         try {
           errorData = await res.json();
         } catch (_) {}
-        throw new Error(errorData.error || `HTTP ${res.status}: Failed to generate content`);
+        const requestError = new Error(errorData.error || `HTTP ${res.status}: Failed to generate content`);
+        Object.assign(requestError, {
+          status: res.status,
+          retryAfterSeconds: Number(res.headers.get('Retry-After')) || null,
+        });
+        throw requestError;
       }
+
+      effectiveModel = res.headers.get('X-Model-Used') || model;
+      session.model = effectiveModel;
 
       const reader = res.body?.getReader();
       if (!reader) {
@@ -405,7 +428,7 @@ export function StoryGenerationProvider({ children }: { children: ReactNode }) {
       // Persist generated story history, model, and active system instruction/preset to database
       await updateStory(storyId, {
         history: finalHistory,
-        model,
+        model: effectiveModel,
         systemInstruction: systemInstruction || undefined,
         presetId: presetId || undefined
       });
@@ -428,7 +451,7 @@ export function StoryGenerationProvider({ children }: { children: ReactNode }) {
           session.messages = partialHistory;
           await updateStory(storyId, {
             history: partialHistory,
-            model,
+            model: effectiveModel,
             systemInstruction: systemInstruction || undefined,
             presetId: presetId || undefined
           });
@@ -440,7 +463,7 @@ export function StoryGenerationProvider({ children }: { children: ReactNode }) {
           session.messages = [...newDisplayHistory];
           await updateStory(storyId, {
             history: session.messages,
-            model,
+            model: effectiveModel,
             systemInstruction: systemInstruction || undefined,
             presetId: presetId || undefined
           });
@@ -451,7 +474,6 @@ export function StoryGenerationProvider({ children }: { children: ReactNode }) {
         }
         notifySubscribers(storyId, session);
       } else {
-        console.error(`[Generation] Error on story ${storyId}:`, err);
         const rawErrMsg = String(err?.message || err || '');
         let displayError = rawErrMsg.replace(/^[a-zA-Z0-9_]+Error:\s*/, '');
 
@@ -476,6 +498,12 @@ export function StoryGenerationProvider({ children }: { children: ReactNode }) {
         }
 
         const lowerErr = (displayError + ' ' + rawErrMsg).toLowerCase();
+        const httpStatus = Number(err?.status);
+        if (httpStatus === 503 || lowerErr.includes('high demand')) {
+          console.warn(`[Generation] Model temporarily unavailable for story ${storyId}.`);
+        } else {
+          console.error(`[Generation] Error on story ${storyId}:`, err);
+        }
         if (displayError === 'Load failed' || displayError === 'Failed to fetch' || lowerErr.includes('networkerror') || lowerErr.includes('failed to fetch')) {
           displayError = '連線中斷或伺服器回應逾時 (Connection interrupted or server timed out)';
         } else if (lowerErr.includes('503') || lowerErr.includes('high demand') || lowerErr.includes('unavailable') || lowerErr.includes('service_unavailable')) {
@@ -484,25 +512,25 @@ export function StoryGenerationProvider({ children }: { children: ReactNode }) {
           displayError = `QUOTA_EXCEEDED: 當前模型 '${model}' 已達免費用量上限 (429 Quota Exceeded)，建議切換至高額度模型 (如 Gemini 2.5 Flash-Lite) 繼續寫作。`;
         }
 
-        const maxAttempts = 3;
+        const isUnavailable = lowerErr.includes('503') || lowerErr.includes('unavailable') || lowerErr.includes('high demand');
+        const maxAttempts = isUnavailable ? 1 : 3;
         const nextAttempt = currentAttempt + 1;
         const activeSettings = loadStoredSettings();
         // If autoReconnect is disabled by user, never start auto-reconnect countdown
         const isRecoverableError = activeSettings.autoReconnect !== false && 
+          ![400, 401, 403, 413].includes(httpStatus) &&
           !lowerErr.includes('quota') && 
           !lowerErr.includes('resource_exhausted') && 
           !lowerErr.includes('429') && 
           !lowerErr.includes('api_key_invalid');
 
         if (isRecoverableError && nextAttempt <= maxAttempts) {
-          let retryModel = model;
-          // Only switch model if autoModelFallback is enabled
-          if (activeSettings.autoModelFallback !== false && nextAttempt >= 2 && retryModel !== 'gemini-2.5-flash-lite') {
-            console.log(`[Auto-Reconnect] Story ${storyId}: switching to high-availability model gemini-2.5-flash-lite`);
-            retryModel = 'gemini-2.5-flash-lite';
-          }
-
-          const delaySeconds = nextAttempt === 1 ? 2 : nextAttempt === 2 ? 3 : 5;
+          const retryAfterSeconds = Number(err?.retryAfterSeconds);
+          const delaySeconds = isUnavailable
+            ? Math.min(MAX_RETRY_DELAY_SECONDS, Math.max(5,
+              Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+                ? retryAfterSeconds : BUSY_RETRY_DELAY_SECONDS))
+            : nextAttempt === 1 ? 2 : nextAttempt === 2 ? 3 : 5;
           session.reconnectState = {
             isReconnecting: true,
             attempt: nextAttempt,
@@ -517,7 +545,7 @@ export function StoryGenerationProvider({ children }: { children: ReactNode }) {
             startGeneration({
               storyId,
               prompt: promptText,
-              model: retryModel,
+              model,
               systemInstruction,
               presetId,
               baseHistory,
@@ -566,7 +594,7 @@ export function StoryGenerationProvider({ children }: { children: ReactNode }) {
           try {
             await updateStory(storyId, {
               history: session.messages,
-              model,
+              model: effectiveModel,
               systemInstruction: systemInstruction || undefined,
               presetId: presetId || undefined
             });
